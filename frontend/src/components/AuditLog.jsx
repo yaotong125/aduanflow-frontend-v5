@@ -1,0 +1,414 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { apiFetch } from '../config';
+import { IconSearch } from './Icons';
+
+/** Map each agent actor to a colour accent so entries are visually distinct. */
+const ACTOR_COLORS = {
+  'Email MCP':            'bg-blue-100 text-blue-700 border-blue-200',
+  'Intake Agent':         'bg-emerald-100 text-emerald-700 border-emerald-200',
+  'Security Agent':       'bg-red-100 text-red-700 border-red-200',
+  'Classification Agent': 'bg-violet-100 text-violet-700 border-violet-200',
+  'Verification Agent':   'bg-amber-100 text-amber-700 border-amber-200',
+  'Financial Agent':      'bg-green-100 text-green-700 border-green-200',
+  'Comms Agent':          'bg-cyan-100 text-cyan-700 border-cyan-200',
+  'Gmail Sync Agent':     'bg-indigo-100 text-indigo-700 border-indigo-200',
+  'Human Investigator':   'bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200 font-semibold',
+};
+
+function formatUTC(dateString, options) {
+  if (!dateString) return '—';
+  // If it's old legacy time-only format, just return it
+  if (!dateString.includes('-')) return dateString;
+  let str = dateString.replace(' ', 'T');
+  const withZ = str.endsWith('Z') ? str : str + 'Z';
+  const date = new Date(withZ);
+  return isNaN(date) ? dateString : date.toLocaleString('en-MY', options);
+}
+
+const ACTOR_DOT = {
+  'Email MCP':            'bg-blue-500',
+  'Intake Agent':         'bg-emerald-500',
+  'Security Agent':       'bg-red-500',
+  'Classification Agent': 'bg-violet-500',
+  'Verification Agent':   'bg-amber-500',
+  'Financial Agent':      'bg-green-500',
+  'Comms Agent':          'bg-cyan-500',
+  'Gmail Sync Agent':     'bg-indigo-500',
+  'Human Investigator':   'bg-fuchsia-500',
+  'System':               'bg-slate-400',
+};
+
+function ActorBadge({ actor }) {
+  const cls = ACTOR_COLORS[actor] || 'bg-slate-100 text-slate-600 border-slate-200';
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold border ${cls}`}>
+      {actor}
+    </span>
+  );
+}
+
+function Spinner() {
+  return (
+    <div className="flex items-center justify-center py-12">
+      <div className="w-8 h-8 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin" />
+      <span className="ml-3 text-sm text-slate-500">Loading audit trail…</span>
+    </div>
+  );
+}
+
+export default function AuditLog({ cases = [], fetchCases, onViewCase }) {
+  const [search, setSearch]           = useState('');
+  const [actorFilter, setActorFilter] = useState('All');
+  const [dbLogs, setDbLogs]           = useState([]);
+  const [loading, setLoading]         = useState(true);
+  const [error, setError]             = useState(null);
+  const [deletingId, setDeletingId]   = useState(null);
+  const [expandedIds, setExpandedIds] = useState(new Set());
+
+  const toggleExpand = useCallback((id) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // ─── Map case objects for instant detail lookup ──────────────────────────
+  const caseMap = useMemo(() => {
+    const map = {};
+    cases.forEach((c) => {
+      if (c.id) map[c.id] = c;
+    });
+    return map;
+  }, [cases]);
+
+  // ─── Fetch from /api/audit (real DB table) ────────────────────────────────
+  const fetchAuditLogs = useCallback(() => {
+    apiFetch('/api/audit?limit=500')
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        setDbLogs(Array.isArray(data) ? data : []);
+        setError(null);
+      })
+      .catch((err) => {
+        console.error('[AuditLog] Failed to fetch from /api/audit:', err);
+        setError('Could not load audit logs from database.');
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    fetchAuditLogs();
+    // Auto-refresh every 15 seconds to show live pipeline activity
+    const timer = setInterval(fetchAuditLogs, 15000);
+    return () => clearInterval(timer);
+  }, [fetchAuditLogs]);
+
+  // ─── Fallback: merge JSON blobs from case objects if DB table is sparse ──
+  const caseLogs = useMemo(
+    () =>
+      cases.flatMap((c) =>
+        (c.auditLog || []).map((entry, idx) => ({
+          id:         `case-blob-${c.id}-${entry.actor}-${idx}`,
+          case_id:    c.id,
+          actor:      entry.actor,
+          action:     entry.action,
+          detail:     entry.detail,
+          created_at: entry.time || null,
+          _time:      formatUTC(entry.time, { dateStyle: 'medium', timeStyle: 'short' }),
+        }))
+      ),
+    [cases]
+  );
+
+  // Normalise DB rows into the same shape as case blob entries
+  const normalisedDbLogs = useMemo(
+    () =>
+      dbLogs.map((row) => ({
+        id:         row.id,
+        case_id:    row.case_id,
+        actor:      row.actor,
+        action:     row.action,
+        detail:     row.detail || '',
+        created_at: row.created_at,
+        _time:      formatUTC(row.created_at, { dateStyle: 'medium', timeStyle: 'short' }),
+        _fromDb: true,
+      })),
+    [dbLogs]
+  );
+
+  // Deduplicate by case_id + actor + action so Human Investigator & pipeline logs are always preserved
+  const existingDbKeys = useMemo(
+    () => new Set(dbLogs.map((r) => `${r.case_id}-${r.actor}-${r.action}`)),
+    [dbLogs]
+  );
+
+  const missingCaseLogs = useMemo(
+    () => caseLogs.filter((e) => !existingDbKeys.has(`${e.case_id}-${e.actor}-${e.action}`)),
+    [caseLogs, existingDbKeys]
+  );
+
+  const allLogs = useMemo(
+    () => [...normalisedDbLogs, ...missingCaseLogs],
+    [normalisedDbLogs, missingCaseLogs]
+  );
+
+  const allActors = useMemo(
+    () => ['All', ...new Set(allLogs.map((l) => l.actor))].sort(),
+    [allLogs]
+  );
+
+  const filtered = useMemo(
+    () =>
+      allLogs.filter((l) => {
+        const matchSearch =
+          (l.case_id || '').toLowerCase().includes(search.toLowerCase()) ||
+          (l.action  || '').toLowerCase().includes(search.toLowerCase()) ||
+          (l.detail  || '').toLowerCase().includes(search.toLowerCase()) ||
+          (l.actor   || '').toLowerCase().includes(search.toLowerCase());
+        const matchActor = actorFilter === 'All' || l.actor === actorFilter;
+        return matchSearch && matchActor;
+      }),
+    [allLogs, search, actorFilter]
+  );
+
+  // ─── Delete an audit log entry ────────────────────────────────────────────
+  const handleDelete = useCallback(async (id, e) => {
+    if (e) e.stopPropagation();
+    if (!window.confirm('Remove this audit entry?')) return;
+    setDeletingId(id);
+    try {
+      const res = await apiFetch(`/api/audit/${id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setDbLogs((prev) => prev.filter((r) => r.id !== id));
+    } catch (err) {
+      alert(`Delete failed: ${err.message}`);
+    } finally {
+      setDeletingId(null);
+    }
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      {/* Page header */}
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900">Audit Log</h2>
+          <p className="text-sm text-slate-500 mt-0.5">
+            Complete AI pipeline & Human Investigator audit trail —{' '}
+            <span className="font-semibold text-blue-600">{allLogs.length}</span> events
+            {normalisedDbLogs.length > 0 && (
+              <span className="ml-1 text-xs text-emerald-600">
+                ({normalisedDbLogs.length} from database)
+              </span>
+            )}
+          </p>
+        </div>
+        <button
+          onClick={() => { setLoading(true); fetchAuditLogs(); if (fetchCases) fetchCases(); }}
+          className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors shadow-sm"
+          title="Refresh audit trail"
+        >
+          <svg className="w-3.5 h-3.5 text-slate-500" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          Refresh
+        </button>
+      </div>
+
+      {/* Filter bar */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-[240px] relative">
+            <IconSearch className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Search by case ID, actor, action, or detail…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors"
+            />
+          </div>
+          <select
+            value={actorFilter}
+            onChange={(e) => setActorFilter(e.target.value)}
+            className="px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-colors"
+          >
+            {allActors.map((a) => (
+              <option key={a} value={a}>{a === 'All' ? 'All Actors' : a}</option>
+            ))}
+          </select>
+          <span className="text-xs text-slate-500 ml-auto">{filtered.length} events</span>
+        </div>
+      </div>
+
+      {/* Error banner */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-sm text-red-700 flex items-center gap-2">
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+          {error} Showing cached data from case records as fallback.
+        </div>
+      )}
+
+      {/* Timeline */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
+        {loading ? (
+          <Spinner />
+        ) : filtered.length === 0 ? (
+          <div className="text-center py-12 text-slate-500">
+            <svg className="w-12 h-12 mx-auto mb-3 text-slate-200" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z" />
+            </svg>
+            <p className="font-medium">No audit events match your filters</p>
+            <p className="text-xs mt-1 text-slate-400">Events appear here as the AI pipeline & investigators process disputes.</p>
+          </div>
+        ) : (
+          <div className="space-y-0">
+            {filtered.map((entry, idx) => {
+              const dotColor = ACTOR_DOT[entry.actor] || 'bg-slate-400';
+              const isDbEntry = !!entry._fromDb;
+              const entryKey = entry.id || `entry-${idx}`;
+              const isExpanded = expandedIds.has(entryKey);
+              const matchedCase = caseMap[entry.case_id];
+
+              return (
+                <div key={entryKey} className="flex gap-3 pb-5 relative group">
+                  {idx < filtered.length - 1 && (
+                    <div className="absolute left-[5.5px] top-5 bottom-0 w-px bg-slate-100" />
+                  )}
+                  {/* Timeline dot */}
+                  <div className={`w-3 h-3 rounded-full ${dotColor} flex-shrink-0 mt-2.5 ring-2 ring-white shadow-sm`} />
+
+                  <div className="flex-1 min-w-0">
+                    {/* Clickable Header Row */}
+                    <div
+                      onClick={() => toggleExpand(entryKey)}
+                      className={`p-3 rounded-xl transition-all cursor-pointer border ${
+                        isExpanded
+                          ? 'bg-blue-50/50 border-blue-200 shadow-xs'
+                          : 'bg-white hover:bg-slate-50 border-transparent hover:border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-mono text-slate-500">{entry._time}</span>
+                            <ActorBadge actor={entry.actor} />
+                            {entry.case_id && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (onViewCase) onViewCase(entry.case_id);
+                                }}
+                                className="text-xs font-mono font-bold text-blue-600 bg-blue-50 border border-blue-200 hover:bg-blue-100 rounded-md px-2 py-0.5 transition-colors cursor-pointer"
+                                title="Open case details"
+                              >
+                                {entry.case_id} ↗
+                              </button>
+                            )}
+                            {!isDbEntry && (
+                              <span className="text-[11px] text-slate-400 italic">(case audit log)</span>
+                            )}
+                          </div>
+                          <p className="text-sm font-semibold text-slate-900">{entry.action}</p>
+                          {entry.detail && !isExpanded && (
+                            <p className="text-xs text-slate-600 line-clamp-1">{entry.detail}</p>
+                          )}
+                        </div>
+
+                        {/* Chevron Expand Indicator */}
+                        <div className="flex items-center gap-2 shrink-0 pt-0.5 text-slate-400 group-hover:text-slate-600">
+                          <span className="text-[11px] font-medium hidden sm:inline text-slate-400">
+                            {isExpanded ? 'Collapse' : 'Click to expand'}
+                          </span>
+                          <svg className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? 'rotate-180 text-blue-600' : ''}`} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </div>
+                      </div>
+
+                      {/* Expandable Details Panel */}
+                      {isExpanded && (
+                        <div className="mt-3 pt-3 border-t border-blue-200/60 space-y-3 font-sans text-xs" onClick={(e) => e.stopPropagation()}>
+                          {/* Extended Detail Text */}
+                          {entry.detail && (
+                            <div className="bg-white p-3 rounded-lg border border-slate-200 text-slate-800 leading-relaxed font-mono whitespace-pre-line shadow-2xs">
+                              <span className="font-semibold text-slate-500 block text-[10px] uppercase tracking-wider mb-1 font-sans">Full Audit Details</span>
+                              {entry.detail}
+                            </div>
+                          )}
+
+                          {/* Matched Case Overview Card (if present) */}
+                          {matchedCase && (
+                            <div className="bg-slate-900 text-slate-100 p-3.5 rounded-lg space-y-2 border border-slate-800">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400 font-mono">Associated Case Snapshot</span>
+                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                                  matchedCase.status === 'FINANCIALLY_RESOLVED' || matchedCase.status === 'PASS'
+                                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                    : matchedCase.status === 'REJECTED'
+                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                    : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                }`}>
+                                  STATUS: {matchedCase.status}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs pt-1">
+                                <div><span className="text-slate-400">Customer:</span> <span className="font-semibold text-white">{matchedCase.customerName}</span></div>
+                                <div><span className="text-slate-400">Account:</span> <span className="font-mono text-slate-300">{matchedCase.maskedAccount}</span></div>
+                                <div><span className="text-slate-400">Exposure:</span> <span className="font-mono text-emerald-400 font-bold">RM {matchedCase.amount?.toLocaleString('en-MY', { minimumFractionDigits: 2 })}</span></div>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Metadata Bar & Actions */}
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-500 border-t border-slate-200/60">
+                            <div className="flex items-center gap-3">
+                              <span>Log ID: <code className="font-mono text-slate-700">{entry.id}</code></span>
+                              <span>Source: <strong className="text-slate-700">{isDbEntry ? 'Database Table (audit_logs)' : 'Case JSON Stream'}</strong></span>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                              {entry.case_id && onViewCase && (
+                                <button
+                                  type="button"
+                                  onClick={() => onViewCase(entry.case_id)}
+                                  className="text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-1 cursor-pointer"
+                                >
+                                  View Case Details ↗
+                                </button>
+                              )}
+
+                              {isDbEntry && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleDelete(entry.id, e)}
+                                  disabled={deletingId === entry.id}
+                                  className="text-xs text-red-500 hover:text-red-700 flex items-center gap-1 font-medium cursor-pointer"
+                                  title="Remove audit entry from database"
+                                >
+                                  {deletingId === entry.id ? 'Deleting…' : '🗑 Delete Entry'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
